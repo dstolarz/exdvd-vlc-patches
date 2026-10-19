@@ -8,7 +8,9 @@ Changes exDVD makes to VLC 3.0.x, published per its licences.
 selected, the first arrow or Select selects button 1, as standalone players
 do. Without it some discs (e.g. Disney's Bill Nye set) cannot be operated
 with arrow keys, and VLC falls back to changing volume and seeking.
-`build.sh` builds the one plugin.
+`build.sh` builds the one plugin against VLC's own libdvdnav/libdvdread
+versions. It defines `HAVE_STREAM_CB_IN_DVDNAV_H`; without it the plugin
+cannot read a DVD image from a stream.
 
 ## vlckit/ (VLCKit 3.6.0 for tvOS, LGPL 2.1+)
 
