@@ -1,0 +1,132 @@
+From 3cdf1f8275310feea7978f48e9d3342b1f78e48e Mon Sep 17 00:00:00 2001
+From: exdvd <test@local>
+Date: Sun, 18 Oct 2026 02:05:53 -0700
+Subject: [PATCH] live video filter chain API; build
+ libpostproc; tvOS 27 SDK fixes
+
+---
+ contrib/src/postproc/rules.mak    |  7 ++++--
+ contrib/src/zlib/rules.mak        |  2 ++
+ include/vlc/libvlc_media_player.h |  5 +++++
+ lib/libvlc.sym                    |  3 +++
+ lib/video.c                       | 37 +++++++++++++++++++++++++++++++
+ 5 files changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/contrib/src/postproc/rules.mak b/contrib/src/postproc/rules.mak
+index 93f33dd39f..7d70ef23a1 100644
+--- a/contrib/src/postproc/rules.mak
++++ b/contrib/src/postproc/rules.mak
+@@ -108,6 +108,10 @@ endif
+ 
+ # Build
+ 
++# exdvd: libpostproc for a GPL test build only (VLC itself uses --disable-postproc)
++ifdef HAVE_DARWIN_OS
++PKGS += postproc
++endif
+ ifdef GPL
+ PKGS += postproc
+ endif
+@@ -128,10 +132,9 @@ postproc: postproc-$(POSTPROC_VERSION).tar.xz .sum-postproc
+ 	$(MOVE)
+ 
+ .postproc: postproc
+-	$(REQUIRE_GPL)
+ 	cd $< && $(HOSTVARS) ./configure \
+ 		--extra-cflags="$(EXTRA_CFLAGS)"  \
+-		--extra-ldflags="$(LDFLAGS)" $(POSTPROCCONF) \
++		--extra-ldflags="$(LDFLAGS) $(EXTRA_CFLAGS)" $(POSTPROCCONF) \
+ 		--prefix="$(PREFIX)" --enable-static --disable-shared
+ 	cd $< && $(MAKE) install-libs install-headers
+ 	touch $@
+diff --git a/contrib/src/zlib/rules.mak b/contrib/src/zlib/rules.mak
+index 4dfd37a2e9..3a6d3b554d 100644
+--- a/contrib/src/zlib/rules.mak
++++ b/contrib/src/zlib/rules.mak
+@@ -21,6 +21,8 @@ $(TARBALLS)/zlib-$(ZLIB_VERSION).tar.xz:
+ zlib: zlib-$(ZLIB_VERSION).tar.xz .sum-zlib
+ 	$(UNPACK)
+ 	$(APPLY) $(SRC)/zlib/no-shared.patch
++	# exdvd: new Apple SDKs define TARGET_OS_MAC; zlib 1.2 then defines fdopen away
++	sed -i.orig 's/defined(MACOS) || defined(TARGET_OS_MAC)/defined(MACOS)/' $(UNPACK_DIR)/zutil.h
+ 	$(MOVE)
+ 
+ .zlib: zlib
+diff --git a/include/vlc/libvlc_media_player.h b/include/vlc/libvlc_media_player.h
+index d499b3d3b8..f03ee8db99 100644
+--- a/include/vlc/libvlc_media_player.h
++++ b/include/vlc/libvlc_media_player.h
+@@ -1595,6 +1595,11 @@ LIBVLC_API float libvlc_video_get_adjust_float( libvlc_media_player_t *p_mi,
+  * \param value adjust option value
+  * \version LibVLC 1.1.1 and later.
+  */
++/** exdvd: live video filter chain and filter options. */
++LIBVLC_API int libvlc_video_set_filter_chain( libvlc_media_player_t *p_mi, const char *psz_chain );
++LIBVLC_API void libvlc_video_set_filter_option_float( libvlc_media_player_t *p_mi, const char *psz_name, float f );
++LIBVLC_API void libvlc_video_set_filter_option_int( libvlc_media_player_t *p_mi, const char *psz_name, int i );
++
+ LIBVLC_API void libvlc_video_set_adjust_float( libvlc_media_player_t *p_mi,
+                                                    unsigned option, float value );
+ 
+diff --git a/lib/libvlc.sym b/lib/libvlc.sym
+index a4f36a40b7..ef2b432300 100644
+--- a/lib/libvlc.sym
++++ b/lib/libvlc.sym
+@@ -273,6 +273,9 @@ libvlc_video_get_track_count
+ libvlc_video_get_track_description
+ libvlc_video_get_width
+ libvlc_video_set_adjust_float
++libvlc_video_set_filter_chain
++libvlc_video_set_filter_option_float
++libvlc_video_set_filter_option_int
+ libvlc_video_set_adjust_int
+ libvlc_video_set_aspect_ratio
+ libvlc_video_set_callbacks
+diff --git a/lib/video.c b/lib/video.c
+index 9bc0f634f5..260131ba53 100644
+--- a/lib/video.c
++++ b/lib/video.c
+@@ -1149,3 +1149,40 @@ char * libvlc_video_get_textrenderer_string( libvlc_media_player_t *p_mi,
+ {
+     return get_string( p_mi, "freetype", textrenderer_option_bynumber(option) );
+ }
++
++/* exdvd: change the video filter chain while playing.
++ * Replace the whole video filter chain, live, on every current vout, and on
++ * the player so later vouts inherit it. "" turns all filters off. Returns the
++ * number of vouts changed. */
++int libvlc_video_set_filter_chain( libvlc_media_player_t *p_mi,
++                                   const char *psz_chain )
++{
++    const char *chain = psz_chain ? psz_chain : "";
++    var_Create( p_mi, "video-filter", VLC_VAR_STRING | VLC_VAR_DOINHERIT );
++    var_SetString( p_mi, "video-filter", chain );
++    size_t n;
++    vout_thread_t **pp_vouts = GetVouts( p_mi, &n );
++    for( size_t i = 0; i < n; i++ )
++    {
++        var_SetString( pp_vouts[i], "video-filter", chain );
++        vlc_object_release( pp_vouts[i] );
++    }
++    free( pp_vouts );
++    return (int)n;
++}
++
++/* exdvd: a filter option ("postproc-q", "gradfun-strength", ...)
++ * on the player, for filters created after this call. */
++void libvlc_video_set_filter_option_float( libvlc_media_player_t *p_mi,
++                                           const char *psz_name, float f )
++{
++    var_Create( p_mi, psz_name, VLC_VAR_FLOAT | VLC_VAR_DOINHERIT );
++    var_SetFloat( p_mi, psz_name, f );
++}
++
++void libvlc_video_set_filter_option_int( libvlc_media_player_t *p_mi,
++                                         const char *psz_name, int i )
++{
++    var_Create( p_mi, psz_name, VLC_VAR_INTEGER | VLC_VAR_DOINHERIT );
++    var_SetInteger( p_mi, psz_name, i );
++}
+-- 
+2.54.0 (Apple Git-157)
+

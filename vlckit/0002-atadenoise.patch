@@ -1,0 +1,246 @@
+From 430bb3cb4db1277132b868662121ea642f3a09df Mon Sep 17 00:00:00 2001
+From: exdvd <test@local>
+Date: Sun, 18 Oct 2026 15:04:17 -0700
+Subject: [PATCH] atadenoise: adaptive temporal averaging denoiser, past frames
+ only (LGPL, from FFmpeg)
+
+---
+ modules/video_filter/Makefile.am  |   2 +
+ modules/video_filter/atadenoise.c | 205 ++++++++++++++++++++++++++++++
+ 2 files changed, 207 insertions(+)
+ create mode 100644 modules/video_filter/atadenoise.c
+
+diff --git a/modules/video_filter/Makefile.am b/modules/video_filter/Makefile.am
+index f65344d486..d96d73ceb2 100644
+--- a/modules/video_filter/Makefile.am
++++ b/modules/video_filter/Makefile.am
+@@ -26,6 +26,7 @@ libfreeze_plugin_la_SOURCES = video_filter/freeze.c
+ libgaussianblur_plugin_la_SOURCES = video_filter/gaussianblur.c
+ libgaussianblur_plugin_la_LIBADD = $(LIBM)
+ libgradfun_plugin_la_SOURCES = video_filter/gradfun.c video_filter/gradfun.h
++libatadenoise_plugin_la_SOURCES = video_filter/atadenoise.c
+ libgradient_plugin_la_SOURCES = video_filter/gradient.c
+ libgradient_plugin_la_LIBADD = $(LIBM)
+ libgrain_plugin_la_SOURCES = video_filter/grain.c
+@@ -97,6 +98,7 @@ video_filter_LTLIBRARIES = \
+ 	libtransform_plugin.la \
+ 	libwave_plugin.la \
+ 	libgradfun_plugin.la \
++	libatadenoise_plugin.la \
+ 	libantiflicker_plugin.la \
+ 	libhqdn3d_plugin.la \
+ 	libanaglyph_plugin.la \
+diff --git a/modules/video_filter/atadenoise.c b/modules/video_filter/atadenoise.c
+new file mode 100644
+index 0000000000..dcd33b92b5
+--- /dev/null
++++ b/modules/video_filter/atadenoise.c
+@@ -0,0 +1,205 @@
++/*****************************************************************************
++ * atadenoise.c: adaptive temporal averaging denoiser, looking back only
++ *****************************************************************************
++ * Ported for exdvd from FFmpeg's libavfilter/vf_atadenoise.c (Paul B Mahol,
++ * 2015), after "Video Denoising Based on Adaptive Temporal Averaging" by
++ * David Bartovcak and Miroslav Vrankic.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation; either version 2.1 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this program; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
++ *****************************************************************************
++ * Each pixel is averaged with the same pixel in up to N earlier frames,
++ * newest first, stopping at the first frame that differs by more than A, or
++ * once the differences add up past B (8-bit levels). Still areas average
++ * many frames; moving edges stop at once.
++ *
++ * FFmpeg looks both ways, so a player must hold pictures back. This looks
++ * back only: no delay, no re-timing. With 12 frames, A=13, B=52 it matched
++ * FFmpeg's centred s=9 at thresholds 0.05/0.1 on The Matrix (measured by
++ * exdvd-gpl-test/tools/ata_causal_proto.py). The history is our own copy of
++ * past frames, never held decoder pictures, which would starve the decoder.
++ *
++ * Change log (newest first):
++ *   v1.0  2026-10-18  New.
++ *****************************************************************************/
++
++#ifdef HAVE_CONFIG_H
++# include "config.h"
++#endif
++
++#include <stdlib.h>
++#include <string.h>
++
++#include <vlc_common.h>
++#include <vlc_plugin.h>
++#include <vlc_filter.h>
++#include <vlc_picture.h>
++
++#define FILTER_PREFIX "atadenoise-"
++#define MAX_FRAMES 24
++
++static int  Open (vlc_object_t *);
++static void Close(vlc_object_t *);
++static picture_t *Filter(filter_t *, picture_t *);
++static void Flush(filter_t *);
++
++vlc_module_begin()
++    set_shortname(N_("ATA denoise"))
++    set_description(N_("Adaptive temporal averaging denoiser"))
++    set_capability("video filter", 0)
++    set_category(CAT_VIDEO)
++    set_subcategory(SUBCAT_VIDEO_VFILTER)
++    add_integer_with_range(FILTER_PREFIX "frames", 12, 1, MAX_FRAMES,
++        N_("Past frames"), N_("How many earlier frames a pixel may average"), false)
++    add_integer_with_range(FILTER_PREFIX "a", 13, 0, 255,
++        N_("Threshold A"), N_("Largest difference to one frame (0-255)"), false)
++    add_integer_with_range(FILTER_PREFIX "b", 52, 0, 6000,
++        N_("Threshold B"), N_("Largest summed difference (0-255 per frame)"), false)
++    add_shortcut("atadenoise")
++    set_callbacks(Open, Close)
++vlc_module_end()
++
++static const char *const filter_options[] = { "frames", "a", "b", NULL };
++
++struct filter_sys_t
++{
++    int      w[3], h[3];
++    int      frames, thra, thrb;
++    uint8_t *hist[MAX_FRAMES][3];     /* past frames, ring; plane-packed */
++    int      head;                    /* next slot to write */
++    int      count;                   /* how many slots hold a frame */
++    mtime_t  last_date;
++};
++
++static int Open(vlc_object_t *obj)
++{
++    filter_t *filter = (filter_t *)obj;
++    const vlc_fourcc_t in = filter->fmt_in.video.i_chroma;
++    const vlc_chroma_description_t *chroma = vlc_fourcc_GetChromaDescription(in);
++
++    if (!chroma || chroma->plane_count != 3 || chroma->pixel_size != 1) {
++        msg_Err(filter, "Unsupported chroma (%4.4s)", (char *)&in);
++        return VLC_EGENERIC;
++    }
++    if (in != filter->fmt_out.video.i_chroma) {
++        msg_Err(filter, "Input and output chromas don't match");
++        return VLC_EGENERIC;
++    }
++
++    filter_sys_t *sys = calloc(1, sizeof(*sys));
++    if (!sys)
++        return VLC_ENOMEM;
++
++    config_ChainParse(filter, FILTER_PREFIX, filter_options, filter->p_cfg);
++    sys->frames = var_CreateGetInteger(filter, FILTER_PREFIX "frames");
++    sys->thra   = var_CreateGetInteger(filter, FILTER_PREFIX "a");
++    sys->thrb   = var_CreateGetInteger(filter, FILTER_PREFIX "b");
++    if (sys->frames < 1) sys->frames = 1;
++    if (sys->frames > MAX_FRAMES) sys->frames = MAX_FRAMES;
++
++    for (int p = 0; p < 3; p++) {
++        sys->w[p] = filter->fmt_in.video.i_width  * chroma->p[p].w.num / chroma->p[p].w.den;
++        sys->h[p] = filter->fmt_in.video.i_height * chroma->p[p].h.num / chroma->p[p].h.den;
++        for (int k = 0; k < sys->frames; k++) {
++            sys->hist[k][p] = malloc((size_t)sys->w[p] * sys->h[p]);
++            if (!sys->hist[k][p]) {
++                filter->p_sys = sys;
++                Close(obj);
++                return VLC_ENOMEM;
++            }
++        }
++    }
++    sys->last_date = VLC_TS_INVALID;
++
++    filter->p_sys = sys;
++    filter->pf_video_filter = Filter;
++    filter->pf_flush = Flush;
++    msg_Dbg(filter, "atadenoise: %d past frames, A=%d, B=%d",
++            sys->frames, sys->thra, sys->thrb);
++    return VLC_SUCCESS;
++}
++
++static void Close(vlc_object_t *obj)
++{
++    filter_t *filter = (filter_t *)obj;
++    filter_sys_t *sys = filter->p_sys;
++    for (int k = 0; k < MAX_FRAMES; k++)
++        for (int p = 0; p < 3; p++)
++            free(sys->hist[k][p]);
++    free(sys);
++}
++
++static void Flush(filter_t *filter)
++{
++    filter->p_sys->count = 0;
++}
++
++static picture_t *Filter(filter_t *filter, picture_t *pic)
++{
++    filter_sys_t *sys = filter->p_sys;
++    if (!pic)
++        return NULL;
++
++    picture_t *out = filter_NewPicture(filter);
++    if (!out) {
++        picture_Release(pic);
++        return NULL;
++    }
++
++    /* A seek or a new stream: the past is no longer the past. */
++    if (sys->last_date == VLC_TS_INVALID || pic->date <= sys->last_date
++     || pic->date - sys->last_date > CLOCK_FREQ)
++        sys->count = 0;
++    sys->last_date = pic->date;
++
++    const int n = sys->count;
++    const int thra = sys->thra, thrb = sys->thrb;
++
++    for (int p = 0; p < 3; p++) {
++        const int w = __MIN(sys->w[p], pic->p[p].i_visible_pitch);
++        const int h = __MIN(sys->h[p], pic->p[p].i_visible_lines);
++        const uint8_t *past[MAX_FRAMES];
++        for (int k = 0; k < n; k++)                    /* newest first */
++            past[k] = sys->hist[(sys->head - 1 - k + 2 * sys->frames) % sys->frames][p];
++
++        for (int y = 0; y < h; y++) {
++            const uint8_t *src = pic->p[p].p_pixels + y * pic->p[p].i_pitch;
++            uint8_t *dst = out->p[p].p_pixels + y * out->p[p].i_pitch;
++            const int row = y * sys->w[p];
++            for (int x = 0; x < w; x++) {
++                const int s = src[x];
++                unsigned sum = s, cnt = 1, sumdiff = 0;
++                for (int k = 0; k < n; k++) {
++                    const int v = past[k][row + x];
++                    const unsigned d = (unsigned)abs(s - v);
++                    sumdiff += d;
++                    if (d > (unsigned)thra || sumdiff > (unsigned)thrb)
++                        break;
++                    sum += v;
++                    cnt++;
++                }
++                dst[x] = (uint8_t)((sum + cnt / 2) / cnt);
++            }
++            /* keep the ORIGINAL row as history */
++            memcpy(sys->hist[sys->head][p] + row, src, w);
++        }
++    }
++    sys->head = (sys->head + 1) % sys->frames;
++    if (sys->count < sys->frames)
++        sys->count++;
++
++    picture_CopyProperties(out, pic);
++    picture_Release(pic);
++    return out;
++}
+-- 
+2.54.0 (Apple Git-157)
+

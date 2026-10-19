@@ -1,0 +1,86 @@
+--- a/modules/access/dvdnav.c	2026-10-18 18:26:38
++++ b/modules/access/dvdnav.c	2026-10-18 18:26:38
+@@ -564,6 +564,27 @@
+ /*****************************************************************************
+  * Control:
+  *****************************************************************************/
++/* exdvd: some discs (Disney's Bill Nye set) open a menu that HAS buttons
++ * with none selected (HL_BTNN 0). A standalone player treats that as button
++ * 1; libdvdnav does not, so no arrow or Select could do anything and libVLC
++ * fell back to changing the volume and seeking. Select button 1 first.
++ * Returns true when it had to (the press that revealed the cursor). */
++static bool EnsureButton( demux_t *p_demux, pci_t *pci )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++    int32_t cur = 0;
++    if( pci == NULL || pci->hli.hl_gi.btn_ns <= 0 )
++        return false;
++    if( dvdnav_get_current_highlight( p_sys->dvdnav, &cur ) != DVDNAV_STATUS_OK )
++        return false;
++    if( cur > 0 && cur <= pci->hli.hl_gi.btn_ns )
++        return false;
++    if( dvdnav_button_select( p_sys->dvdnav, pci, 1 ) != DVDNAV_STATUS_OK )
++        return false;
++    msg_Dbg( p_demux, "menu had no button selected: selected button 1" );
++    return true;
++}
++
+ static int Control( demux_t *p_demux, int i_query, va_list args )
+ {
+     demux_sys_t *p_sys = p_demux->p_sys;
+@@ -747,6 +768,7 @@
+         {
+             pci_t *pci = dvdnav_get_current_nav_pci( p_sys->dvdnav );
+ 
++            EnsureButton( p_demux, pci );
+             if( dvdnav_button_activate( p_sys->dvdnav, pci ) != DVDNAV_STATUS_OK )
+                 return VLC_EGENERIC;
+             ButtonUpdate( p_demux, true );
+@@ -757,6 +779,11 @@
+         {
+             pci_t *pci = dvdnav_get_current_nav_pci( p_sys->dvdnav );
+ 
++            if( EnsureButton( p_demux, pci ) )
++            {
++                ButtonUpdate( p_demux, false );
++                break;
++            }
+             if( dvdnav_upper_button_select( p_sys->dvdnav, pci ) != DVDNAV_STATUS_OK )
+                 return VLC_EGENERIC;
+             break;
+@@ -766,6 +793,11 @@
+         {
+             pci_t *pci = dvdnav_get_current_nav_pci( p_sys->dvdnav );
+ 
++            if( EnsureButton( p_demux, pci ) )
++            {
++                ButtonUpdate( p_demux, false );
++                break;
++            }
+             if( dvdnav_lower_button_select( p_sys->dvdnav, pci ) != DVDNAV_STATUS_OK )
+                 return VLC_EGENERIC;
+             break;
+@@ -775,6 +807,11 @@
+         {
+             pci_t *pci = dvdnav_get_current_nav_pci( p_sys->dvdnav );
+ 
++            if( EnsureButton( p_demux, pci ) )
++            {
++                ButtonUpdate( p_demux, false );
++                break;
++            }
+             if( dvdnav_left_button_select( p_sys->dvdnav, pci ) != DVDNAV_STATUS_OK )
+                 return VLC_EGENERIC;
+             break;
+@@ -784,6 +821,11 @@
+         {
+             pci_t *pci = dvdnav_get_current_nav_pci( p_sys->dvdnav );
+ 
++            if( EnsureButton( p_demux, pci ) )
++            {
++                ButtonUpdate( p_demux, false );
++                break;
++            }
+             if( dvdnav_right_button_select( p_sys->dvdnav, pci ) != DVDNAV_STATUS_OK )
+                 return VLC_EGENERIC;
+             break;

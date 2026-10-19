@@ -1,0 +1,57 @@
+diff --git a/buildMobileVLCKit.sh b/buildMobileVLCKit.sh
+index 6154b91..911a3b8 100755
+--- a/buildMobileVLCKit.sh
++++ b/buildMobileVLCKit.sh
+@@ -406,6 +406,9 @@ buildLibVLC() {
+     export VLCSDKROOT=$SDKROOT
+ 
+     EXTRA_CFLAGS="-isysroot ${SDKROOT}"
++    # exdvd: clang 17+ predefines TARGET_OS_MAC; old contribs (zlib, libpng)
++    # then take their classic-Mac-OS paths and fail on the tvOS 27 SDK
++    EXTRA_CFLAGS+=" -fno-define-target-os-macros"
+     EXTRA_LDFLAGS="-arch ${ACTUAL_ARCH}"
+ 
+     if [ "$PLATFORM" = "OS" ]; then
+@@ -699,6 +702,7 @@ buildLibVLC() {
+         --enable-taglib \
+         --enable-smb2 \
+         --disable-mmx \
++        ${LGPL_ONLY:+--disable-postproc} \
+         --disable-sparkle \
+         --disable-addonmanagermodules \
+         --disable-mad > ${out}
+@@ -767,10 +771,8 @@ buildLibVLC() {
+     invert
+     sepia
+     wave
+-    hqdn3d
+     headphone_channel_mixer
+     gaussianblur
+-    gradfun
+     extract
+     colorthres
+     antiflicker
+@@ -783,6 +785,13 @@ buildLibVLC() {
+     output_livehttp
+     "
+ 
++    # exdvd: LGPL_ONLY=1 builds the App Store library: no GPL filters
++    if [ -n "$LGPL_ONLY" ]; then
++    blacklist="${blacklist}
++    hqdn3d
++    postproc"
++    fi
++
+     if [ "$SCARY" = "no" ]; then
+     blacklist="${blacklist}
+     dts
+@@ -907,7 +916,8 @@ buildMobileKit() {
+ if [ "$BUILD_DEVICE" != "no" ]; then
+     buildMobileKit iphoneos
+ fi
+-if [ "$BUILD_SIMULATOR" != "no" ]; then
++# exdvd: DEVICE_ONLY=1 skips the simulator slice
++if [ "$BUILD_SIMULATOR" != "no" ] && [ -z "$DEVICE_ONLY" ]; then
+     buildMobileKit iphonesimulator
+ fi
+ 
