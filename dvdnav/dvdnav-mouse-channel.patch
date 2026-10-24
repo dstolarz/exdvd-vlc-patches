@@ -1,0 +1,269 @@
+--- a/modules/access/dvdnav.c
++++ b/modules/access/dvdnav.c
+@@ -53,6 +53,8 @@
+ #include <vlc_vout.h>
+ #include <vlc_dialog.h>
+ #include <vlc_iso_lang.h>
++#include <vlc_network.h>
++#include <poll.h>
+ 
+ /* FIXME we should find a better way than including that */
+ #include "../../src/text/iso-639_def.h"
+@@ -86,6 +88,13 @@
+ 
+ #define LANGUAGE_DEFAULT ("en")
+ 
++#define MOUSEPORT_TEXT N_("Coordinate channel TCP port")
++#define MOUSEPORT_LONGTEXT N_( \
++    "Listen on 127.0.0.1:PORT for \"x y [click]\" lines and apply them to the " \
++    "DVD menu as a mouse move/click. 0 disables it. Lets a host that renders " \
++    "through memory callbacks (no window, hence no vout mouse events) still " \
++    "drive dvdnav_mouse_select()/dvdnav_mouse_activate()." )
++
+ static int  AccessDemuxOpen ( vlc_object_t * );
+ static void Close( vlc_object_t * );
+ 
+@@ -103,6 +112,8 @@
+         ANGLE_LONGTEXT, false )
+     add_bool( "dvdnav-menu", true,
+         MENU_TEXT, MENU_LONGTEXT, false )
++    add_integer( "dvdnav-mouse-port", 0, MOUSEPORT_TEXT,
++        MOUSEPORT_LONGTEXT, true )
+     set_capability( "access_demux", 5 )
+     add_shortcut( "dvd", "dvdnav", "file" )
+     set_callbacks( AccessDemuxOpen, Close )
+@@ -169,6 +180,21 @@
+     int           cur_title;
+     int           cur_seekpoint;
+ 
++    /* exdvd: coordinate channel. The socket thread only PARKS a coordinate
++     * here; the demux thread applies it (see MouseDeliver). dvdnav is not
++     * thread safe -- upstream EventMouse even carries a FIXME about it -- and
++     * the demux thread is the one already calling dvdnav_get_next_block(). */
++    struct
++    {
++        vlc_thread_t thread;
++        bool         b_running;
++        int         *fds;
++        vlc_mutex_t  lock;
++        bool         b_pending;
++        bool         b_click;
++        int          x, y;
++    } mouse;
++
+     /* length of program group chain */
+     vlc_tick_t  i_pgc_length;
+     int         i_vobu_index;
+@@ -183,6 +209,24 @@
+ static void DemuxTitles( demux_t * );
+ static void ESSubtitleUpdate( demux_t * );
+ static void ButtonUpdate( demux_t *, bool );
++static void *MouseThread( void * );
++/* ONE mailbox for the whole process (see MouseDeliver). */
++static vlc_mutex_t exdvd_lock = VLC_STATIC_MUTEX;
++static bool exdvd_pending = false, exdvd_click = false;
++static int  exdvd_x = 0, exdvd_y = 0;
++static bool exdvd_listening = false;
++/* exdvd v3: what the menu VM shows NOW, for the server to ask ("?"). Written
++ * by the demux thread from the current NAV packet, read by the socket thread.
++ * A film with forced subtitles has a subpicture on but no buttons; a menu has
++ * buttons. VLC's own subpicture id cannot tell them apart (both 48416). */
++static volatile int exdvd_btn_ns = -1, exdvd_hli_ss = -1;
++/* ONE listener for the whole process (exdvd v2). A per-module listener was
++ * handed from one dvdnav instance to the next, and the next one opens BEFORE
++ * the last one closes (a menu restart, a film handoff): it found the port
++ * taken, went without, and then the old one closed it. Nobody listened. */
++static int *exdvd_fds = NULL;
++static vlc_thread_t exdvd_thread;
++static void MouseDeliver( demux_t * );
+ 
+ static void ESNew( demux_t *, int );
+ static int ProbeDVD( const char * );
+@@ -324,6 +368,35 @@
+     if( !vlc_timer_create( &p_sys->still.timer, StillTimer, p_sys ) )
+         p_sys->still.b_created = true;
+ 
++    /* exdvd: optional coordinate channel, off unless a port is given */
++    vlc_mutex_init( &p_sys->mouse.lock );
++    p_sys->mouse.b_pending = false;
++    p_sys->mouse.b_running = false;
++    p_sys->mouse.fds = NULL;
++    int i_mouse_port = var_CreateGetInteger( p_demux, "dvdnav-mouse-port" );
++    vlc_mutex_lock( &exdvd_lock );
++    if( i_mouse_port > 0 && !exdvd_listening )
++    {
++        exdvd_fds = net_ListenTCP( p_demux, "127.0.0.1", i_mouse_port );
++        if( exdvd_fds == NULL )
++            msg_Warn( p_demux, "cannot listen on 127.0.0.1:%d for coordinates",
++                      i_mouse_port );
++        else if( vlc_clone( &exdvd_thread, MouseThread, NULL,
++                                   VLC_THREAD_PRIORITY_LOW ) )
++        {
++            msg_Warn( p_demux, "cannot start the coordinate thread" );
++            net_ListenClose( exdvd_fds );
++            exdvd_fds = NULL;
++        }
++        else
++        {
++            exdvd_listening = true;     /* for the life of the process */
++            msg_Info( p_demux, "coordinate channel on 127.0.0.1:%d",
++                      i_mouse_port );
++        }
++    }
++    vlc_mutex_unlock( &exdvd_lock );
++
+     return VLC_SUCCESS;
+ }
+ 
+@@ -529,6 +602,20 @@
+         var_DelCallback( p_sys->p_vout, "mouse-clicked", EventMouse, p_demux );
+     }
+ 
++    /* exdvd: stop the coordinate channel and RELEASE THE CLAIM.
++     *
++     * Missing the release was a real bug with a very confusing symptom: going
++     * into a title tears this module down and builds a new one, the new
++     * instance saw exdvd_listening still true and declined to listen, and the
++     * old listener had just been closed -- so the channel died permanently
++     * after the first playback round-trip. The server then got ECONNREFUSED,
++     * fell back to the oracle, and the user saw "tapping worked, then stopped
++     * once I came back from a submenu". */
++    /* v2: the listener belongs to the process, not to this instance, so
++     * there is nothing to stop here. A parked coordinate is left for the
++     * next instance, which is the one on screen. */
++    vlc_mutex_destroy( &p_sys->mouse.lock );
++
+     /* Stop still image handler */
+     if( p_sys->still.b_created )
+         vlc_timer_destroy( p_sys->still.timer );
+@@ -873,10 +960,130 @@
+ /*****************************************************************************
+  * Demux:
+  *****************************************************************************/
++/*****************************************************************************
++ * MouseThread: accept "x y [click]" on loopback and park the coordinate.
++ *****************************************************************************
++ * Deliberately does NO dvdnav work -- see the comment on demux_sys_t.mouse.
++ *****************************************************************************/
++static void *MouseThread( void *data )
++{
++    (void)data;
++
++
++    for( ;; )
++    {
++        /* Plain accept(), NOT net_Accept(): net_Accept never returned here even
++         * though connect() succeeded -- and connect() succeeding proves only
++         * that the kernel queued it on the listen backlog, not that anyone
++         * accepted it. accept() is a pthread cancellation point, so vlc_cancel
++         * + vlc_join in Close() still tears this down cleanly. */
++        /* net_ListenTCP() returns a NON-BLOCKING socket, so a bare accept()
++         * returns -1/EAGAIN immediately and the connection just sits on the
++         * backlog unaccepted -- which is why connect() always succeeded while
++         * nothing was ever read. Wait for readability first. poll() is also a
++         * cancellation point, so Close()'s vlc_cancel still tears this down. */
++        struct pollfd pfd = { .fd = exdvd_fds[0], .events = POLLIN };
++        int pr = poll( &pfd, 1, -1 );
++        if( pr < 0 )
++        {
++            if( errno == EINTR )
++                continue;
++            break;
++        }
++        int fd = accept( exdvd_fds[0], NULL, NULL );
++        if( fd >= 0 )
++        {
++            /* BSD/macOS: accept() INHERITS O_NONBLOCK from the listening
++             * socket, so recv() returned EAGAIN instantly and the read loop
++             * never ran -- the connection was accepted and dropped unread.
++             * Clear it explicitly; do not assume a fresh fd is blocking. */
++            int fl = fcntl( fd, F_GETFL, 0 );
++            if( fl != -1 )
++                fcntl( fd, F_SETFL, fl & ~O_NONBLOCK );
++        }
++        if( fd < 0 )
++        {
++            if( errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK )
++                continue;
++            break;
++        }
++
++        char buf[64];
++        ssize_t n;
++        while( ( n = recv( fd, buf, sizeof(buf) - 1, 0 ) ) > 0 )
++        {
++                buf[n] = '\0';
++            if( buf[0] == '?' )
++            {
++                /* v3: "?" -> "<buttons> <highlight status>\n" */
++                char out[32];
++                int k = snprintf( out, sizeof(out), "%d %d\n",
++                                  exdvd_btn_ns, exdvd_hli_ss );
++                send( fd, out, k, 0 );
++                continue;
++            }
++            int x, y, i_click = 0;
++            if( sscanf( buf, "%d %d %d", &x, &y, &i_click ) >= 2 )
++            {
++                vlc_mutex_lock( &exdvd_lock );
++                exdvd_x = x; exdvd_y = y;
++                exdvd_click = i_click != 0;
++                exdvd_pending = true;
++                vlc_mutex_unlock( &exdvd_lock );
++            }
++        }
++        net_Close( fd );
++    }
++    return NULL;   /* the listening socket failed: no more taps this process */
++}
++
++/*****************************************************************************
++ * MouseDeliver: apply a parked coordinate, on the demux thread.
++ *****************************************************************************
++ * Same two calls upstream's EventMouse makes, from the thread that owns dvdnav.
++ *****************************************************************************/
++static void MouseDeliver( demux_t *p_demux )
++{
++    demux_sys_t *p_sys = p_demux->p_sys;
++
++    {
++        pci_t *cur = dvdnav_get_current_nav_pci( p_sys->dvdnav );
++        exdvd_btn_ns = cur ? (int)cur->hli.hl_gi.btn_ns : -1;
++        exdvd_hli_ss = cur ? (int)cur->hli.hl_gi.hli_ss : -1;
++    }
++
++    vlc_mutex_lock( &exdvd_lock );
++    bool b_pending = exdvd_pending;
++    bool b_click   = exdvd_click;
++    int  x = exdvd_x, y = exdvd_y;
++    exdvd_pending = false;
++    vlc_mutex_unlock( &exdvd_lock );
++
++    if( !b_pending )
++        return;
++
++    pci_t *pci = dvdnav_get_current_nav_pci( p_sys->dvdnav );
++    fprintf( stderr, "exdvd: %d,%d %s (pci=%p, %d buttons)\n", x, y,
++             b_click ? "activate" : "select", (void *)pci,
++             pci ? (int)pci->hli.hl_gi.btn_ns : -1 ); fflush( stderr );
++    if( pci == NULL )
++        return;
++
++    if( b_click )
++    {
++        ButtonUpdate( p_demux, true );
++        dvdnav_mouse_activate( p_sys->dvdnav, pci, x, y );
++    }
++    else
++        dvdnav_mouse_select( p_sys->dvdnav, pci, x, y );
++}
++
+ static int Demux( demux_t *p_demux )
+ {
+     demux_sys_t *p_sys = p_demux->p_sys;
+ 
++    MouseDeliver( p_demux );
++
+     uint8_t buffer[DVD_VIDEO_LB_LEN];
+     uint8_t *packet = buffer;
+     int i_event;

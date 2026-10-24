@@ -8,6 +8,11 @@ Changes exDVD makes to VLC 3.0.x, published per its licences.
 selected, the first arrow or Select selects button 1, as standalone players
 do. Without it some discs (e.g. Disney's Bill Nye set) cannot be operated
 with arrow keys, and VLC falls back to changing volume and seeking.
+`dvdnav-mouse-channel.patch`: a loopback channel (`--dvdnav-mouse-port`).
+`x y [click]` selects or activates the menu button at that point, as a mouse
+would; `?` answers the current NAV packet's button count and highlight
+status. It lets a host that renders without a window (memory callbacks)
+send taps to the menu VLC is showing.
 `build.sh` builds the one plugin against VLC's own libdvdnav/libdvdread
 versions. It defines `HAVE_STREAM_CB_IN_DVDNAV_H`; without it the plugin
 cannot read a DVD image from a stream.

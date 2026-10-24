@@ -1,5 +1,6 @@
 #!/bin/sh
-# Build VLC 3.0.23's dvdnav module with dvdnav-default-button.patch, as one
+# Build VLC 3.0.23's dvdnav module with dvdnav-default-button.patch and
+# dvdnav-mouse-channel.patch, as one
 # plugin for a stock VLC 3.0.23 on macOS. libdvdnav 6.1.1 and libdvdread
 # 6.1.3 (VLC's versions, with VLC's contrib patches) are linked statically.
 # Needs Xcode's compiler, autoconf, automake, libtool.
@@ -24,6 +25,7 @@ C=$W/vlc-$V/contrib/src
   && make -s install >/dev/null)
 cd vlc-$V
 patch -p1 < "$HERE/dvdnav-default-button.patch"
+patch -p1 < "$HERE/dvdnav-mouse-channel.patch"
 # configure only writes config.h; nothing else of VLC is built.
 ./configure --disable-lua --disable-qt --disable-skins2 --disable-macosx \
   --disable-sparkle --disable-vlc --disable-nls --disable-avcodec \
